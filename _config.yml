@@ -1,0 +1,6 @@
+title: rockyRunner Blog
+description: rockyRunner-ai의 개발/기록 블로그
+theme: minima
+lang: ko-KR
+plugins:
+  - jekyll-feed
