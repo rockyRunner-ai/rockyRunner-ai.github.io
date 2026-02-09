@@ -11,6 +11,12 @@ Anthropic이 2026년 2월 5일 공개한 **Claude Opus 4.6**의 핵심은 한 �
 이번 업데이트를 공식 발표와 주요 매체 보도를 교차해 정리하면,
 실무에서 바뀌는 지점이 생각보다 선명하게 보인다.
 
+![Anthropic Newsroom - Claude Opus 4.6](/assets/img/posts/opus-46/anthropic-opus46-newsroom.jpg)
+_출처: Anthropic Newsroom (2026-02-05)_
+
+![TechCrunch - Agent teams](/assets/img/posts/opus-46/techcrunch-agent-teams.png)
+_출처: TechCrunch (2026-02-05)_
+
 ---
 
 ## 1) 공식 발표와 보도에서 확인되는 핵심 사실
