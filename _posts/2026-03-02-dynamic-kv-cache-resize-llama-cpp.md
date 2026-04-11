@@ -3,7 +3,7 @@ title: "Dynamic KV Cache Resize in llama.cpp — 8 GB Savings on a 27B Model"
 date: 2026-03-02 13:00:00 +0900
 categories: [Research, LLM Internals]
 tags: [llm, kv-cache, dynamic-resize, llama-cpp, apple-silicon, memory-management, benchmark]
-description: "Start with 16 MB, grow to 5 GB on demand. How a 215-line patch to llama.cpp eliminated GPU OOM crashes and saved 8 GB of memory on Apple Silicon."
+description: "Start with 16 MB and grow on demand. An experimental llama.cpp patch that reduced upfront KV allocation and avoided GPU OOM on Apple Silicon."
 image:
   path: /assets/img/posts/kv-cache/dynamic-memory-growth.png
 mermaid: true
@@ -21,7 +21,7 @@ The idea is straightforward:
 
 1. **Start small** — allocate a KV cache with 256 cells instead of the full context size
 2. **Grow on demand** — when `init_batch()` fails because the cache is full, call `try_resize()` to allocate a bigger cache, copy existing data, and retry
-3. **Re-reserve the scheduler** — after resizing, the compute graph's tensor sizes change, so the backend scheduler needs to re-reserve its memory
+3. **Re-reserve the scheduler** — after `init_batch()` triggers a resize, `llama_context` notices the resize flag and re-reserves compute buffers before graph execution
 
 ```mermaid
 flowchart TD
@@ -48,41 +48,45 @@ bool llama_kv_cache::try_resize() {
     // calculate new size with growth strategy
     uint32_t new_size = calculate_growth(kv_size_cur);
 
-    // create a temporary cache with the new size
+    // create a temporary cache with the new size;
+    // kv_size_max=0 disables the "start at 256" logic for the temp cache
     llama_kv_cache tmp(model, saved_type_k, saved_type_v, ...
-                       new_size, ... saved_lazy_alloc, kv_size_max_val);
+                       new_size, ... /* kv_size_max = */ 0);
 
     // copy existing data layer by layer
-    tmp.copy_from(*this, kv_size_cur);
+    tmp.copy_from(*this);
 
     // steal the internals
     ctxs_bufs = std::move(tmp.ctxs_bufs);
     layers    = std::move(tmp.layers);
     v_cells   = std::move(tmp.v_cells);
+    v_heads   = std::move(tmp.v_heads);
 }
 ```
 
 When `tmp` goes out of scope, the old (smaller) buffers are freed. The cache now has a bigger backing store with all existing KV data preserved.
 
-### Layer-by-Layer Copy
+### Layer-by-Layer, Stream-by-Stream Copy
 
-The `copy_from()` method copies tensor data one layer at a time through a CPU staging buffer:
+The `copy_from()` method copies tensor data through a CPU staging buffer one layer at a time, and one stream view at a time:
 
 ```cpp
-void llama_kv_cache::copy_from(const llama_kv_cache & other, uint32_t n_cells) {
+void llama_kv_cache::copy_from(const llama_kv_cache & other) {
     for (size_t il = 0; il < layers.size(); ++il) {
-        // copy K tensor for this layer
-        std::vector<uint8_t> staging(n_cells * row_size);
-        ggml_backend_tensor_get(k_src, staging.data(), 0, n_bytes);
-        ggml_backend_tensor_set(k_dst, staging.data(), 0, n_bytes);
+        for (size_t s = 0; s < other.layers[il].k_stream.size(); ++s) {
+            std::vector<uint8_t> staging(ggml_nbytes(other.layers[il].k_stream[s]));
+            ggml_backend_tensor_get(other.layers[il].k_stream[s], staging.data(), 0, staging.size());
+            ggml_backend_tensor_set(layers[il].k_stream[s], staging.data(), 0, staging.size());
+        }
 
-        // copy V tensor for this layer
-        // ... same pattern
+        // same pattern for V stream views
     }
 }
 ```
 
-This is critical for memory efficiency. A naive approach would allocate the new cache (which is 2x the old one), then copy — meaning peak memory is **3x the current cache**. Layer-by-layer copy keeps the staging buffer to just one layer's worth of data.
+This is critical for memory efficiency. A naive approach would allocate the new cache and copy the whole KV region in one shot. The current code limits the staging buffer to one layer/stream view at a time.
+
+The current version also keeps KV buffers zero-initialized. The memory savings come from starting with a much smaller cache, not from leaving padding or future rows uninitialized.
 
 ## Growth Strategy: The 4→8 GB Jump Problem
 
@@ -98,7 +102,7 @@ Doubling:   ... → 32K (2 GB) → 64K (4 GB) → 128K (8 GB) → 💥 GPU OOM
 
 On a 32 GB system with a 27B model (~16 GB), the available RAM for KV cache is ~6-7 GB. A 4→8 GB jump overshoots and crashes immediately.
 
-The fix: **linear growth above a threshold.**
+The fix: **linear-ish growth after a small-cache phase.**
 
 ```
 Doubling + Linear:
@@ -106,18 +110,21 @@ Doubling + Linear:
                      ↑ +1 GB       ↑ +1 GB      ↑ +1 GB      ↑ +1 GB
 ```
 
-The implementation calculates a `one_gb_cells` threshold based on the model's actual KV dimensions and switches from doubling to linear growth when the cache exceeds it:
+The current implementation uses a simple heuristic:
 
 ```cpp
-const uint32_t one_gb_cells = 1024*1024*1024 /
-    (hparams.n_embd_k_gqa() * ggml_type_size(saved_type_k) +
-     hparams.n_embd_v_gqa() * ggml_type_size(saved_type_v));
-
-if (kv_size_cur < one_gb_cells)
-    new_size = std::min(kv_size_cur * 2, kv_size_max_val);     // double
-else
-    new_size = std::min(kv_size_cur + one_gb_cells, kv_size_max_val); // +1 GB
+if (kv_size_cur < 4096) {
+    new_size = kv_size_cur * 2;
+} else {
+    const size_t total = total_size();
+    const size_t per_cell = total / kv_size_cur;
+    const uint32_t cells_per_gb =
+        per_cell > 0 ? (uint32_t) (1024ULL * 1024 * 1024 / per_cell) : kv_size_cur;
+    new_size = kv_size_cur + std::max(cells_per_gb, 256u);
+}
 ```
+
+So the switch point is currently a fixed `4096` cells. The "+1 GB" step is still derived from the model's actual current KV footprint, but the threshold itself is just a heuristic.
 
 ## The Hybrid Model Gotcha
 
@@ -131,22 +138,22 @@ res = new llama_memory_hybrid(model, type_k, type_v, ...
                               offload, unified,
                               filter_attn, filter_recr);
 
-// After: forward lazy_alloc and kv_size_max
+// After: forward kv_size_max into the attention KV cache path
 res = new llama_memory_hybrid(model, type_k, type_v, ...
                               offload, unified,
-                              cparams.kv_dynamic,
-                              cparams.kv_dynamic ? cparams.n_ctx_seq : 0,
-                              filter_attn, filter_recr);
+                              filter_attn, filter_recr,
+                              cparams.kv_dynamic ? cparams.n_ctx_seq : 0);
 ```
 
 The hybrid model's `init_batch()` also needed its own retry logic:
 
 ```cpp
 auto heads_attn = mem_attn->prepare(ubatches);
-if (heads_attn.empty()) {
-    if (mem_attn->try_resize()) {
-        heads_attn = mem_attn->prepare(ubatches);
+while (heads_attn.empty()) {
+    if (!mem_attn->try_resize()) {
+        break;
     }
+    heads_attn = mem_attn->prepare(ubatches);
 }
 ```
 
@@ -190,27 +197,26 @@ Context: **131,072 tokens** (`-c 131072`)
 | Max usable tokens | ~89 (unreliable) | **80K+** |
 | RSS at 89 tokens | 24,474 MB | 16,145 MB (**-8.3 GB**) |
 | Swap at 1K tokens | +1,560 MB | 0 MB |
-| Total resize overhead | N/A | ~45ms × 10 = **0.1% of total inference** |
 
 The TPS decrease from 4.66 (1K) to 2.32 (80K) is expected — it's caused by attention's O(n²) complexity scaling with context length, not by the dynamic resize mechanism.
 
 ## The Final Code
 
-The complete implementation is **215 insertions and 10 deletions** across 11 files:
+The current implementation is **215 insertions and 7 deletions** across 11 files:
 
 ```
  common/arg.cpp              |   7 +++
  common/common.cpp           |   1 +
  common/common.h             |   1 +
  include/llama.h             |   1 +
- src/llama-context.cpp       |  24 ++++++++
+ src/llama-context.cpp       |  29 ++++++++++
  src/llama-cparams.h         |   1 +
- src/llama-kv-cache.cpp      | 136 ++++++++++++++++++++++++++++++++++--
- src/llama-kv-cache.h        |  28 ++++++++-
- src/llama-memory-hybrid.cpp |  17 +++++-
- src/llama-memory-hybrid.h   |   3 +
+ src/llama-kv-cache.cpp      | 133 +++++++++++++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h        |  26 ++++++++-
+ src/llama-memory-hybrid.cpp |  13 ++++-
+ src/llama-memory-hybrid.h   |   4 +-
  src/llama-model.cpp         |   6 +-
- 11 files changed, 215 insertions(+), 10 deletions(-)
+ 11 files changed, 215 insertions(+), 7 deletions(-)
 ```
 
 No custom GPU kernels. No new wrapper classes. No ggml modifications. Just growth logic inside the existing `llama_kv_cache` class, triggered automatically when the cache is full and `--kv-dynamic` is enabled.
